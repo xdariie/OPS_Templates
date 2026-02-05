@@ -1,232 +1,158 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-#define ERR(source)                                                            \
-  (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__),             \
-   kill(0, SIGKILL), exit(EXIT_FAILURE))
+#define DELAY_MS 300
 
-#define ITER_COUNT 25
-volatile sig_atomic_t last_sig;
+volatile sig_atomic_t sig1_count = 0;
+volatile sig_atomic_t got_sig1 = 0;
+volatile sig_atomic_t got_sig2 = 0;
 
-ssize_t bulk_read(int fd, char *buf, size_t count) {
-  ssize_t c;
-  ssize_t len = 0;
-  do {
-    c = TEMP_FAILURE_RETRY(read(fd, buf, count));
-    if (c < 0)
-      return c;
-    if (c == 0)
-      return len; // EOF
-    buf += c;
-    len += c;
-    count -= c;
-  } while (count > 0);
-  return len;
+pid_t *children;
+int idx;
+int n;
+char **names;
+pid_t parent_pid;
+
+void ms_sleep(int ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    nanosleep(&ts, NULL);
 }
 
-ssize_t bulk_write(int fd, char *buf, size_t count) {
-  ssize_t c;
-  ssize_t len = 0;
-  do {
-    c = TEMP_FAILURE_RETRY(write(fd, buf, count));
-    if (c < 0)
-      return c;
-    buf += c;
-    len += c;
-    count -= c;
-  } while (count > 0);
-  return len;
+void sigusr1_handler(int sig) {
+    got_sig1 = 1;
 }
 
-void sethandler(void (*f)(int), int sigNo) {
-  struct sigaction act;
-  memset(&act, 0, sizeof(struct sigaction));
-  act.sa_handler = f;
-  if (-1 == sigaction(sigNo, &act, NULL))
-    ERR("sigaction");
+void sigusr2_handler(int sig) {
+    got_sig2 = 1;
 }
 
-void ms_sleep(unsigned int milli) {
-  time_t sec = (int)(milli / 1000);
-  milli = milli - (sec * 1000);
-  struct timespec ts = {0};
-  ts.tv_sec = sec;
-  ts.tv_nsec = milli * 1000000L;
-  if (TEMP_FAILURE_RETRY(nanosleep(&ts, &ts)))
-    ERR("nanosleep");
+void child_process() {
+    struct sigaction sa1 = {0}, sa2 = {0};
+    sa1.sa_handler = sigusr1_handler;
+    sa2.sa_handler = sigusr2_handler;
+
+    sigaction(SIGUSR1, &sa1, NULL);
+    sigaction(SIGUSR2, &sa2, NULL);
+
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    while (1) {
+        sigset_t waitmask;
+        sigemptyset(&waitmask);
+        sigsuspend(&waitmask);
+
+        if (got_sig1) {
+            got_sig1 = 0;
+            sig1_count++;
+
+            char fname[32];
+            snprintf(fname, sizeof(fname), "page%d", sig1_count);
+            int fd = open(fname, O_CREAT | O_RDWR | O_APPEND, 0666);
+            if (fd >= 0) close(fd);
+
+            printf("[%d] I, %s, sign the Declaration\n",
+                   getpid(), names[idx]);
+            fflush(stdout);
+
+            ms_sleep(DELAY_MS);
+
+            if (idx > 0)
+                kill(children[idx - 1], SIGUSR1);
+        }
+
+        if (got_sig2) {
+            printf("[%d] Done!\n", getpid());
+            fflush(stdout);
+
+            if (idx > 0)
+                kill(children[idx - 1], SIGUSR2);
+            else
+                kill(parent_pid, SIGUSR2);
+
+            exit(0);
+        }
+    }
 }
 
-void usage(int argc, char *argv[]) {
-  printf("%s n\n", argv[0]);
-  printf("\t1 <= n <= 4 -- number of moneyboxes\n");
-  exit(EXIT_FAILURE);
-}
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s k name1 [name2 ...]\n", argv[0]);
+        exit(1);
+    }
 
-void sig_handler(int sig) { last_sig = sig; }
+    char *end;
+    int k = strtol(argv[1], &end, 10);
+    if (*end || k < 1 || k > 25) {
+        fprintf(stderr, "Invalid k\n");
+        exit(1);
+    }
 
-void collection_box_work() {
-  int total_collected = 0;
-  sethandler(sig_handler, SIGUSR1);
-  sigset_t mask, oldmask;
-  sigemptyset(&mask);
-  sigaddset(&mask, SIGUSR1);
-  sigaddset(&mask, SIGTERM);
-  sigprocmask(SIG_BLOCK, &mask, &oldmask);
-  printf("[%d] Collection box opened\n", getpid());
-  char buf[69];
-  snprintf(buf, 67, "skarbona_%d", getpid());
-  int fd = open(buf, O_CREAT | O_TRUNC | O_RDONLY, 0644);
-  if (fd == -1) {
-    ERR("open");
-  }
-  int donation;
-  int pid;
-  while (sigsuspend(&oldmask)) {
-    if (last_sig == SIGUSR1) {
-      lseek(fd, -8, SEEK_END);
-      if (bulk_read(fd, (char *)&donation, sizeof(int)) == -1) {
-        ERR("bulk_read");
-      }
-      if (bulk_read(fd, (char *)&pid, sizeof(int)) == -1) {
-        ERR("bulk_read");
-      }
-      total_collected += donation;
-      printf("[%d] Citizen %d threw in %d PLN. Thank you! Total collected: %d "
-             "PLN\n",
-             getpid(), pid, donation, total_collected);
-    }
-    if (last_sig == SIGTERM) {
-      kill(0, SIGTERM);
-      break;
-    }
-  }
-  close(fd);
-}
+    n = argc - 2;
+    names = &argv[2];
+    parent_pid = getpid();
 
-void create_n_collection_boxes(int n, pid_t *arr) {
-  for (int i = 0; i < n; i++) {
-    pid_t pid = fork();
-    arr[i] = pid;
-    if (pid == -1) {
-      ERR("fork");
-    }
-    if (pid == 0) {
-      collection_box_work();
-      exit(EXIT_SUCCESS);
-    }
-  }
-}
+    children = calloc(n, sizeof(pid_t));
+    if (!children) exit(1);
 
-void donor_work(int n, pid_t *arr) {
-  srand(getpid());
-  sethandler(sig_handler, SIGUSR1);
-  sethandler(sig_handler, SIGUSR2);
-  sethandler(sig_handler, SIGPIPE);
-  sethandler(sig_handler, SIGINT);
+    // Stage 1: create processes
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            printf("[%d] My name is %s\n", getpid(), names[i]);
+            fflush(stdout);
+            exit(0);
+        }
+        children[i] = pid;
+    }
 
-  sigset_t mask, oldmask;
-  sigemptyset(&mask);
-  sigaddset(&mask, SIGUSR1);
-  sigaddset(&mask, SIGUSR2);
-  sigaddset(&mask, SIGPIPE);
-  sigaddset(&mask, SIGINT);
-  sigaddset(&mask, SIGTERM);
-  sigprocmask(SIG_BLOCK, &mask, &oldmask);
-  int box_num;
-  while (sigsuspend(&oldmask)) {
-    if (last_sig == SIGUSR1) {
-      box_num = 0;
-      break;
-    }
-    if (last_sig == SIGUSR2) {
-      box_num = 1;
-      break;
-    }
-    if (last_sig == SIGPIPE) {
-      box_num = 2;
-      break;
-    }
-    if (last_sig == SIGINT) {
-      box_num = 3;
-      break;
-    }
-    if (last_sig == SIGTERM) {
-      kill(0, SIGTERM);
-      exit(EXIT_SUCCESS);
-    }
-  }
-  printf("[%d] Directed to collection box no %d\n", getpid(), box_num);
+    for (int i = 0; i < n; i++)
+        waitpid(children[i], NULL, 0);
 
-  if (n <= box_num) {
-    printf("[%d] Nothing here, I'm going home!\n", getpid());
-    return;
-  }
-  char buf[69];
-  snprintf(buf, 67, "skarbona_%d", arr[box_num]);
-  int fd = open(buf, O_APPEND | O_WRONLY);
-  if (fd == -1) {
-    ERR("open");
-  }
-  int donation = (rand() % 1901) + 100;
-  if (write(fd, &donation, sizeof(int)) == -1) {
-    ERR("write");
-  }
-  int curr_pid = getpid();
-  if (write(fd, &curr_pid, sizeof(int)) == -1) {
-    ERR("write");
-  }
-  close(fd);
+    printf("Done!\n");
 
-  printf("[%d] I'm throwing in %d PLN\n", curr_pid, donation);
-  kill(arr[box_num], SIGUSR1);
-}
+    // recreate children for stages 2–4 
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            idx = i;
+            child_process();
+        }
+        children[i] = pid;
+    }
 
-void create_donors(int num, pid_t *arr) {
-  srand(getpid());
-  int sig_arr[4] = {SIGUSR1, SIGUSR2, SIGPIPE, SIGINT};
-  for (;;) {
-    pid_t pid = fork();
-    if (pid == -1) {
-      ERR("fork");
+    //Stage 2 + 3 
+    for (int i = 0; i < k; i++) {
+        kill(children[n - 1], SIGUSR1);
+        ms_sleep(DELAY_MS);
     }
-    if (pid == 0) {
-      donor_work(num, arr);
-      exit(EXIT_SUCCESS);
-    }
-    ms_sleep(100);
-    kill(pid, sig_arr[rand() % 4]);
-    while (waitpid(pid, NULL, 0) != pid) {
-    }
-    if (last_sig == SIGTERM) {
-      kill(0, SIGTERM);
-      break;
-    }
-  }
-}
 
-int main(int argc, char *argv[]) {
-  if (argc != 2) {
-    usage(argc, argv);
-  }
-  int num = atoi(argv[1]);
-  if (num < 1 || num > 4) {
-    usage(argc, argv);
-  }
-  srand(getpid());
-  sethandler(sig_handler, SIGTERM);
+    // Stage 3 termination
+    kill(children[n - 1], SIGUSR2);
 
-  pid_t children_pid[num];
-  create_n_collection_boxes(num, children_pid);
-  create_donors(num, children_pid);
-  while (wait(NULL) > 0) {
-  }
-  printf("Collection ended!\n");
+    // wait for SIGUSR2 from child 1
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    int sig;
+    sigwait(&mask, &sig);
+
+    for (int i = 0; i < n; i++)
+        waitpid(children[i], NULL, 0);
+
+    return 0;
 }

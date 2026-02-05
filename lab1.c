@@ -179,3 +179,22 @@ char path[MAX_PATH];
         if (chdir(path))
             ERR("chdir");
     }
+
+
+
+//Template 9: getopt
+//takes the arguments
+
+getopt(argc, argv, "p:n:s:"); //takes -p -n and -s options
+
+//Template 10: strtol
+//string to long
+
+strtol(optarg, (char **)NULL, 8); // optarg - what you want to convert; NULL - show where stopped; 8 - number base
+
+
+umask(~perms & 0777); //umask disable the permissions inside() so here the file will becreated with "perms" permissions
+
+
+int fseek(FILE *stream, long offset, int whence);
+//1.opened file; 2. where to start from; 3. how to move
