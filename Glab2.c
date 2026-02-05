@@ -1,158 +1,150 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
-#define DELAY_MS 300
+#define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), kill(0, SIGKILL), exit(EXIT_FAILURE))
+#define DELAY_MS 100
 
-volatile sig_atomic_t sig1_count = 0;
-volatile sig_atomic_t got_sig1 = 0;
-volatile sig_atomic_t got_sig2 = 0;
+volatile sig_atomic_t last_sig = 0;
 
-pid_t *children;
-int idx;
-int n;
-char **names;
-pid_t parent_pid;
+ssize_t bulk_read(int fd, char* buf, size_t count)
+{
+    ssize_t c, len = 0;
+    do {
+        c = TEMP_FAILURE_RETRY(read(fd, buf, count));
+        if (c < 0) return c;
+        if (c == 0) return len;
+        buf += c;
+        len += c;
+        count -= c;
+    } while (count > 0);
+    return len;
+}
 
-void ms_sleep(int ms) {
+ssize_t bulk_write(int fd, char* buf, size_t count)
+{
+    ssize_t c, len = 0;
+    do {
+        c = TEMP_FAILURE_RETRY(write(fd, buf, count));
+        if (c < 0) return c;
+        buf += c;
+        len += c;
+        count -= c;
+    } while (count > 0);
+    return len;
+}
+
+void sethandler(void (*f)(int), int sigNo)
+{
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = f;
+    if (sigaction(sigNo, &act, NULL) < 0)
+        ERR("sigaction");
+}
+
+void ms_sleep(unsigned int milli)
+{
     struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000;
-    nanosleep(&ts, NULL);
+    ts.tv_sec = milli / 1000;
+    ts.tv_nsec = (milli % 1000) * 1000000L;
+    if (TEMP_FAILURE_RETRY(nanosleep(&ts, &ts)))
+        ERR("nanosleep");
 }
 
-void sigusr1_handler(int sig) {
-    got_sig1 = 1;
+void usage(int argc, char* argv[])
+{
+    printf("%s k name1 [name2 ...]\n", argv[0]);
+    exit(EXIT_FAILURE);
 }
 
-void sigusr2_handler(int sig) {
-    got_sig2 = 1;
+void sig_handler(int sig)
+{
+    last_sig = sig;
 }
 
-void child_process() {
-    struct sigaction sa1 = {0}, sa2 = {0};
-    sa1.sa_handler = sigusr1_handler;
-    sa2.sa_handler = sigusr2_handler;
+int main(int argc, char* argv[])
+{
+    if (argc < 3) usage(argc, argv);
+    int k = atoi(argv[1]);
+    if (k < 1 || k > 25) usage(argc, argv);
 
-    sigaction(SIGUSR1, &sa1, NULL);
-    sigaction(SIGUSR2, &sa2, NULL);
+    int n = argc - 2;
+    char **names = &argv[2];
+    pid_t *pids = malloc(n * sizeof(pid_t));
+    if (!pids) ERR("malloc");
 
-    sigset_t mask;
+    sigset_t mask, oldmask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGUSR1);
     sigaddset(&mask, SIGUSR2);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
 
-    while (1) {
-        sigset_t waitmask;
-        sigemptyset(&waitmask);
-        sigsuspend(&waitmask);
-
-        if (got_sig1) {
-            got_sig1 = 0;
-            sig1_count++;
-
-            char fname[32];
-            snprintf(fname, sizeof(fname), "page%d", sig1_count);
-            int fd = open(fname, O_CREAT | O_RDWR | O_APPEND, 0666);
-            if (fd >= 0) close(fd);
-
-            printf("[%d] I, %s, sign the Declaration\n",
-                   getpid(), names[idx]);
-            fflush(stdout);
-
-            ms_sleep(DELAY_MS);
-
-            if (idx > 0)
-                kill(children[idx - 1], SIGUSR1);
-        }
-
-        if (got_sig2) {
-            printf("[%d] Done!\n", getpid());
-            fflush(stdout);
-
-            if (idx > 0)
-                kill(children[idx - 1], SIGUSR2);
-            else
-                kill(parent_pid, SIGUSR2);
-
-            exit(0);
-        }
-    }
-}
-
-int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s k name1 [name2 ...]\n", argv[0]);
-        exit(1);
-    }
-
-    char *end;
-    int k = strtol(argv[1], &end, 10);
-    if (*end || k < 1 || k > 25) {
-        fprintf(stderr, "Invalid k\n");
-        exit(1);
-    }
-
-    n = argc - 2;
-    names = &argv[2];
-    parent_pid = getpid();
-
-    children = calloc(n, sizeof(pid_t));
-    if (!children) exit(1);
-
-    // Stage 1: create processes
     for (int i = 0; i < n; i++) {
         pid_t pid = fork();
+        if (pid < 0) ERR("fork");
+
         if (pid == 0) {
-            printf("[%d] My name is %s\n", getpid(), names[i]);
+            sethandler(sig_handler, SIGUSR1);
+            sethandler(sig_handler, SIGUSR2);
+            sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+            printf("%d My name is %s\n", getpid(), names[i]);
             fflush(stdout);
-            exit(0);
+
+            int count = 0;
+            for (;;) {
+                sigsuspend(&oldmask);
+                if (last_sig == SIGUSR1) {
+                    count++;
+                    char fname[64];
+                    snprintf(fname, sizeof(fname), "page%d", count);
+                    int fd = open(fname, O_WRONLY | O_CREAT | O_APPEND, 0666);
+                    if (fd < 0) ERR("open");
+                    char line[128];
+                    int len = snprintf(line, sizeof(line), "%d %s\n", getpid(), names[i]);
+                    bulk_write(fd, line, len);
+                    close(fd);
+                    ms_sleep(DELAY_MS);
+                    if (i > 0)
+                        kill(pids[i-1], SIGUSR1);
+                    else
+                        kill(getppid(), SIGUSR2);
+                }
+                else if (last_sig == SIGUSR2) {
+                    printf("%d Done!\n", getpid());
+                    fflush(stdout);
+                    if (i > 0)
+                        kill(pids[i-1], SIGUSR2);
+                    free(pids);
+                    exit(EXIT_SUCCESS);
+                }
+            }
         }
-        children[i] = pid;
+        pids[i] = pid;
     }
 
+    sethandler(sig_handler, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+    for (int i = 0; i < k; i++) {
+        kill(pids[n-1], SIGUSR1);
+        sigsuspend(&oldmask);
+    }
+
+    kill(pids[n-1], SIGUSR2);
+
     for (int i = 0; i < n; i++)
-        waitpid(children[i], NULL, 0);
+        waitpid(pids[i], NULL, 0);
 
     printf("Done!\n");
-
-    // recreate children for stages 2–4 
-    for (int i = 0; i < n; i++) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            idx = i;
-            child_process();
-        }
-        children[i] = pid;
-    }
-
-    //Stage 2 + 3 
-    for (int i = 0; i < k; i++) {
-        kill(children[n - 1], SIGUSR1);
-        ms_sleep(DELAY_MS);
-    }
-
-    // Stage 3 termination
-    kill(children[n - 1], SIGUSR2);
-
-    // wait for SIGUSR2 from child 1
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGUSR2);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
-
-    int sig;
-    sigwait(&mask, &sig);
-
-    for (int i = 0; i < n; i++)
-        waitpid(children[i], NULL, 0);
-
-    return 0;
+    free(pids);
+    return EXIT_SUCCESS;
 }
